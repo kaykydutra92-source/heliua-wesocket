@@ -1,0 +1,12 @@
+version: "3.9"
+services:
+  solana-bot:
+    build: .
+    container_name: helius-wesocket-solana-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - .:/app                    # bind mount for local dev; remove if you want immutable image
+      - ./tokens.db:/app/tokens.db
+    ports:
+      - "3000:3000"

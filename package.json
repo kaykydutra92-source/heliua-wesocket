@@ -1,0 +1,18 @@
+{
+  "name": "helius-wesocket",
+  "version": "1.1.0",
+  "description": "Solana token listing detector with Helius WebSocket, SQLite, Telegram and Dashboard",
+  "main": "node-app.js",
+  "scripts": {
+    "start": "node node-app.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "dotenv": "^17.2.3",
+    "ejs": "^3.1.10",
+    "express": "^4.19.2",
+    "sqlite": "^4.2.2",
+    "sqlite3": "^5.1.7",
+    "ws": "^8.18.0"
+  }
+}

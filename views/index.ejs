@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>Tokens Dashboard</title>
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; background: #f4f6f8; padding: 20px; }
+    table { border-collapse: collapse; width: 100%; background: #fff; box-shadow: 0 2px 8px rgba(0,0,0,.05); }
+    th, td { padding: 10px; border-bottom: 1px solid #eee; text-align: left; }
+    th { background: #fafafa; font-weight: 600; }
+    a { color: #1a73e8; text-decoration: none; }
+    .small { color: #666; font-size: 12px; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+  </style>
+</head>
+<body>
+  <h1>Detected Tokens</h1>
+  <p class="small">
+    This dashboard reads <code>tokens.db</code>. <b>notified=1</b> means a Telegram message was sent.
+    The app filters by <code>ONLY_TODAY</code> / <code>MAX_AGE_SECONDS</code> if configured.
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Mint</th>
+        <th>Program</th>
+        <th>Tx</th>
+        <th>First Seen (local)</th>
+        <th>Notified</th>
+        <th>Verified</th>
+      </tr>
+    </thead>
+    <tbody>
+      <% tokens.forEach(t => { %>
+      <tr>
+        <td><code><%= t.token_address %></code></td>
+        <td><%= t.program_id || '—' %></td>
+        <td>
+          <% if (t.liquidity_tx) { %>
+            <a href="https://solscan.io/tx/<%= t.liquidity_tx %>" target="_blank"><%= t.liquidity_tx %></a>
+          <% } else { %>—<% } %>
+        </td>
+        <td><%= t.first_seen ? new Date(t.first_seen * 1000).toLocaleString() : '-' %></td>
+        <td><%= t.notified %></td>
+        <td><%= t.verified %></td>
+      </tr>
+      <% }) %>
+    </tbody>
+  </table>
+</body>
+</html>
