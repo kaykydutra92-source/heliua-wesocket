@@ -124,6 +124,94 @@ function isBase58OrSystem(str) {
   return isB58(str);
 }
 
+function safeJSONParse(value, fallback = null) {
+  if (!value) return fallback;
+  if (typeof value === 'object') return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
+function serializeMetadata(meta) {
+  if (!meta) return null;
+  if (typeof meta === 'string') return meta;
+  try {
+    return JSON.stringify(meta);
+  } catch (e) {
+    debugLog('serializeMetadata error', e?.message || e);
+    return null;
+  }
+}
+
+function mergeArraysUnique(existing = [], incoming = []) {
+  const out = Array.isArray(existing) ? existing.slice() : [];
+  for (const item of incoming || []) {
+    if (!out.includes(item)) out.push(item);
+  }
+  return out;
+}
+
+function mergeDetectionMetadata(current, incoming) {
+  if (!incoming) return current || null;
+  const result = {
+    score: Math.max(current?.score || 0, incoming.score || 0),
+    sources: mergeArraysUnique(current?.sources, incoming.sources),
+    details: Array.isArray(current?.details) ? current.details.slice() : []
+  };
+  if (Array.isArray(incoming.details)) {
+    for (const detail of incoming.details) {
+      result.details.push(detail);
+    }
+  }
+  if (incoming.timestamp && !result.timestamp) {
+    result.timestamp = incoming.timestamp;
+  }
+  return result;
+}
+
+function mergeVerificationMetadata(current, incoming) {
+  if (!incoming) return current || null;
+  const result = Array.isArray(current)
+    ? current.slice()
+    : (current && typeof current === 'object' ? [current] : []);
+  if (Array.isArray(incoming)) {
+    for (const entry of incoming) result.push(entry);
+  } else {
+    result.push(incoming);
+  }
+  return result;
+}
+
+function mergeMetadataObjects(existing, extra) {
+  if (!extra) return existing || null;
+  const base = existing && typeof existing === 'object' ? { ...existing } : {};
+  if (extra.detection) {
+    base.detection = mergeDetectionMetadata(base.detection, extra.detection);
+  }
+  if (extra.verification) {
+    base.verification = mergeVerificationMetadata(base.verification, extra.verification);
+  }
+  if (!extra.detection && !extra.verification) {
+    const misc = Array.isArray(base.misc) ? base.misc.slice() : [];
+    misc.push(extra);
+    base.misc = misc;
+  }
+  return base;
+}
+
+function buildDetectionMetadata(source, details = {}, score = 0) {
+  return {
+    detection: {
+      sources: [source],
+      details: [{ source, ...details }],
+      score,
+      timestamp: Date.now()
+    }
+  };
+}
+
 /* =====================================
  * Rate limiter & circuit breaker
  * ===================================*/
@@ -289,10 +377,21 @@ async function sendTelegram(text) {
  * ===================================*/
 async function insertTokenRow(token, txSig, pid, verified = 0, metadata = null) {
   const db = await dbPromise;
+  const nowTs = Math.floor(Date.now() / 1000);
   try {
+    const existing = await db.get('SELECT metadata FROM tokens WHERE token_address=?', [token]).catch(() => null);
+    const existingMeta = existing?.metadata ? safeJSONParse(existing.metadata, null) : null;
+    const mergedMeta = metadata && existingMeta ? mergeMetadataObjects(existingMeta, metadata) : (metadata || existingMeta || null);
+    const serialized = serializeMetadata(mergedMeta);
     await db.run(
-      'INSERT OR IGNORE INTO tokens (token_address, first_seen, liquidity_tx, program_id, verified, metadata) VALUES (?, ?, ?, ?, ?, ?)',
-      [token, Math.floor(Date.now() / 1000), txSig || null, pid || null, verified ? 1 : 0, metadata ? JSON.stringify(metadata) : null]
+      `INSERT INTO tokens (token_address, first_seen, liquidity_tx, program_id, verified, metadata)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(token_address) DO UPDATE SET
+         liquidity_tx = COALESCE(excluded.liquidity_tx, tokens.liquidity_tx),
+         program_id = COALESCE(excluded.program_id, tokens.program_id),
+         verified = MAX(tokens.verified, excluded.verified),
+         metadata = COALESCE(?, tokens.metadata)`,
+      [token, nowTs, txSig || null, pid || null, verified ? 1 : 0, serialized, serialized]
     );
   } catch (e) {
     errLog('insertTokenRow error', e?.message || e);
@@ -304,7 +403,9 @@ async function markTokenNotified(token) {
 }
 async function markTokenVerified(token, metadata) {
   const db = await dbPromise;
-  await db.run('UPDATE tokens SET verified=1, metadata=? WHERE token_address=?', [metadata ? JSON.stringify(metadata) : null, token]);
+  const existing = await db.get('SELECT metadata FROM tokens WHERE token_address=?', [token]).catch(() => null);
+  const merged = mergeMetadataObjects(existing?.metadata ? safeJSONParse(existing.metadata, null) : null, metadata);
+  await db.run('UPDATE tokens SET verified=1, metadata=? WHERE token_address=?', [serializeMetadata(merged), token]);
   await db.run('INSERT OR REPLACE INTO verified_mints (token_address, verified_at) VALUES (?, ?)', [token, Math.floor(Date.now() / 1000)]);
 }
 async function isTokenNotified(token) {
@@ -370,7 +471,10 @@ function releaseInspectSlot() {
 async function httpPostWithRetry(url, body, retries = VERIFY_RETRIES) {
   let attempt = 0;
   let lastErr = null;
-  const roster = [url, ...RPC_ALT_URLS];
+  const roster = [url, ...RPC_ALT_URLS].filter(Boolean);
+  if (!roster.length) {
+    throw new Error('No RPC endpoints available for HTTP POST');
+  }
   let endpointIdx = 0;
   while (attempt <= retries) {
     if (typeof acquireRpcToken === 'function') await acquireRpcToken();
@@ -505,8 +609,9 @@ async function verifyCandidate(sig, candidate) {
         const r = await verifyMintViaTransaction(sig, candidate);
         if (r.ok) {
           verifiedCache.set(candidate, { verifiedAt: Date.now() });
-          await markTokenVerified(candidate, r.metadata);
-          return { ok: true, method: 'transaction', metadata: r.metadata };
+          const payload = { method: 'transaction', source: r.metadata?.source || 'transaction', details: r.metadata || null, verifiedAt: Date.now() };
+          await markTokenVerified(candidate, { verification: payload });
+          return { ok: true, method: 'transaction', metadata: payload };
         }
         const base = VERIFY_BASE_DELAY_MS * Math.pow(2, i);
         await sleep(currentThrottleDelay(base));
@@ -517,8 +622,9 @@ async function verifyCandidate(sig, candidate) {
       const r2 = await verifyMintViaAccount(candidate);
       if (r2.ok) {
         verifiedCache.set(candidate, { verifiedAt: Date.now() });
-        await markTokenVerified(candidate, r2.metadata);
-        return { ok: true, method: 'account', metadata: r2.metadata };
+        const payload = { method: 'account', source: r2.metadata?.source || 'account', details: r2.metadata || null, verifiedAt: Date.now() };
+        await markTokenVerified(candidate, { verification: payload });
+        return { ok: true, method: 'account', metadata: payload };
       }
       const base = VERIFY_BASE_DELAY_MS * Math.pow(2, i);
       await sleep(currentThrottleDelay(base));
@@ -562,6 +668,314 @@ function findProgramInLogs(logs) {
   return null;
 }
 
+function toBigIntValue(value) {
+  if (value === null || value === undefined) return 0n;
+  try {
+    return BigInt(String(value));
+  } catch {
+    return 0n;
+  }
+}
+
+function logsIncludeAny(logs, identifiers) {
+  if (!Array.isArray(logs) || !identifiers || !identifiers.length) return false;
+  return logs.some(line => typeof line === 'string' && identifiers.some(id => id && line.includes(id)));
+}
+
+function extractAccountKeysFromMessage(message, meta) {
+  const keys = [];
+  const pushKey = key => {
+    if (typeof key === 'string' && isBase58OrSystem(key)) keys.push(key);
+    else if (key && typeof key.pubkey === 'string' && isBase58OrSystem(key.pubkey)) keys.push(key.pubkey);
+    else if (key && typeof key.toString === 'function') {
+      const val = key.toString();
+      if (isBase58OrSystem(val)) keys.push(val);
+    }
+  };
+  const rawKeys = (message && (message.accountKeys || message.staticAccountKeys)) || [];
+  for (const k of rawKeys) pushKey(k);
+  const loaded = meta?.loadedAddresses;
+  if (loaded) {
+    for (const group of ['writable', 'readonly']) {
+      for (const k of loaded[group] || []) pushKey(k);
+    }
+  }
+  return keys.filter(isBase58OrSystem);
+}
+
+function extractMintAddressesFromInfo(info, path = []) {
+  const results = [];
+  if (!info || typeof info !== 'object') return results;
+  for (const [key, value] of Object.entries(info)) {
+    const nextPath = path.concat(key);
+    if (!value) continue;
+    if (typeof value === 'string') {
+      if (/mint/i.test(key) && isBase58OrSystem(value)) {
+        results.push({ value, field: key, path: nextPath.join('.') });
+      }
+    } else if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i++) {
+        results.push(...extractMintAddressesFromInfo(value[i], nextPath.concat(String(i))));
+      }
+    } else if (typeof value === 'object') {
+      results.push(...extractMintAddressesFromInfo(value, nextPath));
+    }
+  }
+  return results;
+}
+
+function resolveProgramIdFromInstruction(inst, accountKeys) {
+  if (!inst) return null;
+  if (typeof inst.programId === 'string' && isBase58OrSystem(inst.programId)) return inst.programId;
+  if (typeof inst.program === 'string' && isBase58OrSystem(inst.program)) return inst.program;
+  if (inst.programId && typeof inst.programId.toString === 'function') {
+    const asString = inst.programId.toString();
+    if (isBase58OrSystem(asString)) return asString;
+  }
+  if (typeof inst.programIdIndex === 'number' && Array.isArray(accountKeys)) {
+    const candidate = accountKeys[inst.programIdIndex];
+    if (candidate && isBase58OrSystem(candidate)) return candidate;
+  }
+  return null;
+}
+
+function collectInstructions(message, meta) {
+  const all = [];
+  const push = (instruction, source, index, parent) => {
+    if (!instruction) return;
+    all.push({ instruction, source, index, parent });
+  };
+  const parsed = message?.parsedInstructions;
+  if (Array.isArray(parsed)) {
+    parsed.forEach((inst, idx) => push(inst, 'parsed', idx, null));
+  }
+  const raw = message?.instructions;
+  if (Array.isArray(raw)) {
+    raw.forEach((inst, idx) => push(inst, 'message', idx, null));
+  }
+  const compiled = message?.compiledInstructions;
+  if (Array.isArray(compiled)) {
+    compiled.forEach((inst, idx) => push(inst, 'compiled', idx, null));
+  }
+  const inner = meta?.innerInstructions || [];
+  for (const entry of inner) {
+    const list = entry?.instructions || [];
+    list.forEach((inst, idx) => push(inst, 'inner', idx, entry?.index));
+  }
+  return all;
+}
+
+function computeTokenBalanceDiffs(meta) {
+  const diffs = [];
+  if (!meta) return diffs;
+  const pre = Array.isArray(meta.preTokenBalances) ? meta.preTokenBalances : [];
+  const post = Array.isArray(meta.postTokenBalances) ? meta.postTokenBalances : [];
+  const preMap = new Map();
+  const makeKey = (entry) => `${entry?.mint || ''}:${entry?.accountIndex ?? ''}:${entry?.owner || ''}`;
+  for (const entry of pre) {
+    preMap.set(makeKey(entry), toBigIntValue(entry?.uiTokenAmount?.amount ?? entry?.amount ?? 0));
+  }
+  for (const entry of post) {
+    if (!entry?.mint || !isBase58OrSystem(entry.mint)) continue;
+    const key = makeKey(entry);
+    const before = preMap.get(key) ?? 0n;
+    const after = toBigIntValue(entry?.uiTokenAmount?.amount ?? entry?.amount ?? 0);
+    const delta = after - before;
+    diffs.push({ entry, mint: entry.mint, before, after, delta, accountIndex: entry.accountIndex, owner: entry.owner });
+  }
+  return diffs;
+}
+
+function gatherDetectionContext(evt) {
+  const logs = Array.isArray(evt?.logs) ? evt.logs : Array.isArray(evt?.value?.logs) ? evt.value.logs : [];
+  const transaction = evt?.transaction || evt?.value?.transaction || null;
+  const meta = evt?.meta || transaction?.meta || evt?.value?.meta || null;
+  const message = transaction?.transaction?.message || transaction?.message || null;
+  const accountKeysOrdered = extractAccountKeysFromMessage(message, meta);
+  const accountKeySet = Array.from(new Set(accountKeysOrdered.filter(Boolean)));
+  const instructions = collectInstructions(message, meta);
+  const tokenBalanceDiffs = computeTokenBalanceDiffs(meta);
+  const mintedFromBalances = new Set(tokenBalanceDiffs.filter(d => d.delta > 0n && d.mint && isBase58OrSystem(d.mint)).map(d => d.mint));
+  const programHints = new Set();
+  const programFromLogs = findProgramInLogs(logs);
+  if (programFromLogs) programHints.add(programFromLogs);
+  const eventProgramId = evt?.programId || evt?.program || evt?.ownerProgram || evt?.value?.programId;
+  if (typeof eventProgramId === 'string' && isBase58OrSystem(eventProgramId)) programHints.add(eventProgramId);
+  const blockTime = evt?.blockTime ?? evt?.value?.blockTime ?? transaction?.blockTime ?? null;
+  const slot = evt?.slot ?? evt?.value?.slot ?? null;
+  return {
+    evt,
+    logs,
+    meta,
+    transaction,
+    message,
+    accountKeysOrdered,
+    accountKeySet,
+    instructions,
+    tokenBalanceDiffs,
+    mintedFromBalances,
+    programHints,
+    programFromLogs,
+    blockTime,
+    slot
+  };
+}
+
+function buildCandidateRegistrar(context) {
+  const map = new Map();
+  return {
+    register(mint, { score = 0, source = 'unknown', detail = {}, programId = null } = {}) {
+      if (!mint || !isBase58OrSystem(mint)) return;
+      let entry = map.get(mint);
+      if (!entry) {
+        entry = { mint, score: 0, sources: new Set(), details: [], programIds: new Set() };
+        map.set(mint, entry);
+      }
+      entry.score += score;
+      if (source) entry.sources.add(source);
+      if (detail && Object.keys(detail).length) entry.details.push({ source, ...detail });
+      if (programId && isBase58OrSystem(programId)) entry.programIds.add(programId);
+      return entry;
+    },
+    finalize() {
+      const hints = Array.from(context.programHints);
+      const primaryHint = hints.length === 1 ? hints[0] : null;
+      return Array.from(map.values()).map(entry => {
+        if (!entry.programIds.size && primaryHint) entry.programIds.add(primaryHint);
+        if (!entry.programIds.size && context.programFromLogs) entry.programIds.add(context.programFromLogs);
+        return {
+          mint: entry.mint,
+          score: entry.score,
+          sources: Array.from(entry.sources),
+          details: entry.details,
+          programIds: Array.from(entry.programIds)
+        };
+      }).sort((a, b) => b.score - a.score);
+    }
+  };
+}
+
+function detectCandidatesFromEvent(evt) {
+  const context = gatherDetectionContext(evt);
+  const registrar = buildCandidateRegistrar(context);
+  const logs = context.logs;
+  const logCandidates = extractCandidatesFromLogs(logs);
+  const logCandidateSet = new Set(logCandidates.map(c => c.candidate));
+
+  // Structured token transfers
+  const transfers = Array.isArray(evt?.tokenTransfers) ? evt.tokenTransfers : [];
+  for (const transfer of transfers) {
+    if (!transfer?.mint || !isBase58OrSystem(transfer.mint)) continue;
+    const programId = transfer?.programId || transfer?.program || transfer?.sourceProgramId || null;
+    registrar.register(transfer.mint, {
+      score: 120,
+      source: 'token-transfer',
+      programId,
+      detail: {
+        amount: transfer?.tokenAmount ?? transfer?.amount ?? null,
+        from: transfer?.fromUserAccount || transfer?.fromTokenAccount || null,
+        to: transfer?.toUserAccount || transfer?.toTokenAccount || null
+      }
+    });
+  }
+
+  // Structured AMM events
+  const amm = evt?.events?.amm;
+  if (amm) {
+    const ammProgram = amm?.programId || amm?.program || null;
+    const tokens = [
+      amm?.tokenA?.mint || amm?.tokenA?.token?.mint,
+      amm?.tokenB?.mint || amm?.tokenB?.token?.mint,
+      amm?.lpToken?.mint || amm?.poolTokenMint
+    ].filter(isBase58OrSystem);
+    for (const mint of tokens) {
+      registrar.register(mint, {
+        score: 110,
+        source: 'amm-event',
+        programId: ammProgram,
+        detail: { side: 'amm', label: amm?.label || null }
+      });
+    }
+  }
+
+  // Token balance diffs
+  for (const diff of context.tokenBalanceDiffs) {
+    if (!diff?.mint || diff.delta <= 0n) continue;
+    registrar.register(diff.mint, {
+      score: 45,
+      source: 'post-token-balance',
+      programId: context.programFromLogs,
+      detail: {
+        delta: diff.delta.toString(),
+        accountIndex: diff.accountIndex,
+        owner: diff.owner || null
+      }
+    });
+  }
+
+  // Instruction parsing
+  for (const item of context.instructions) {
+    const inst = item.instruction || {};
+    const parsed = inst.parsed || {};
+    const info = parsed.info || inst.info || null;
+    if (!info || typeof info !== 'object') continue;
+    const programId = resolveProgramIdFromInstruction(inst, context.accountKeysOrdered);
+    if (programId) context.programHints.add(programId);
+    const type = parsed.type || inst.type || '';
+    const mintInfos = extractMintAddressesFromInfo(info);
+    if (!mintInfos.length && typeof info.account === 'string' && /initialize/i.test(String(type)) && isBase58OrSystem(info.account)) {
+      mintInfos.push({ value: info.account, field: 'account', path: 'info.account' });
+    }
+    for (const mintInfo of mintInfos) {
+      const bonus = /mint|initialize|pool|liquidity|create/i.test(String(type)) ? 20 : 0;
+      registrar.register(mintInfo.value, {
+        score: 30 + bonus,
+        source: `instruction:${item.source}`,
+        programId,
+        detail: { field: mintInfo.field, path: mintInfo.path, type }
+      });
+    }
+  }
+
+  // Log heuristics
+  for (const candidate of logCandidates) {
+    registrar.register(candidate.candidate, {
+      score: 10 + candidate.score * 2,
+      source: 'log-heuristic',
+      programId: context.programFromLogs,
+      detail: { score: candidate.score }
+    });
+  }
+
+  // Account key reinforcement
+  for (const key of context.accountKeySet) {
+    if (!key || !isBase58OrSystem(key)) continue;
+    if (PROGRAM_IDS.includes(key) || EFFECTIVE_WHITELIST.includes(key)) continue;
+    let score = 0;
+    const reasons = [];
+    if (context.mintedFromBalances.has(key)) { score += 12; reasons.push('balance-diff'); }
+    if (logCandidateSet.has(key)) { score += 10; reasons.push('log-match'); }
+    if (!score) continue;
+    registrar.register(key, {
+      score: score + 5,
+      source: 'account-key',
+      programId: context.programFromLogs,
+      detail: { reasons }
+    });
+  }
+
+  const candidates = registrar.finalize();
+  return { context, candidates };
+}
+
+function candidatePassesFilters(candidate, context) {
+  const logs = context.logs;
+  const programs = candidate.programIds || [];
+  const hasProgramMatch = !PROGRAM_IDS.length || programs.some(pid => PROGRAM_IDS.includes(pid)) || logsIncludeAny(logs, PROGRAM_IDS);
+  const hasWhitelistMatch = !EFFECTIVE_WHITELIST.length || programs.some(pid => EFFECTIVE_WHITELIST.includes(pid)) || logsIncludeAny(logs, EFFECTIVE_WHITELIST);
+  return hasProgramMatch && hasWhitelistMatch;
+}
+
 /* =====================================
  * Fallback inspector: programNotification pubkey -> signatures -> tx -> mint
  * ===================================*/
@@ -603,8 +1017,8 @@ async function inspectSignaturesForMint(pubkey, limit = FALLBACK_SIGNATURE_LIMIT
           if (p && p.mint) {
             const mint = p.mint;
             const pid = findProgramInLogs(tx.meta?.logMessages || []) || null;
-            await insertTokenRow(mint, signature, pid, 0, { source: 'fallback-post', info: p });
-            await enqueueNotification(mint, signature, pid);
+            const meta = buildDetectionMetadata('fallback-post', { info: p, signature });
+            await enqueueNotification(mint, signature, pid, meta);
             return true;
           }
         }
@@ -614,8 +1028,8 @@ async function inspectSignaturesForMint(pubkey, limit = FALLBACK_SIGNATURE_LIMIT
         if (candidates && candidates.length) {
           const top = candidates[0].candidate;
           const pid = findProgramInLogs(logs) || null;
-          await insertTokenRow(top, signature, pid, 0, { source: 'fallback-log', score: candidates[0].score });
-          await enqueueNotification(top, signature, pid);
+          const meta = buildDetectionMetadata('fallback-log', { score: candidates[0].score, signature });
+          await enqueueNotification(top, signature, pid, meta);
           return true;
         }
       }
@@ -633,12 +1047,15 @@ async function inspectSignaturesForMint(pubkey, limit = FALLBACK_SIGNATURE_LIMIT
 /* =====================================
  * Notification queue
  * ===================================*/
-async function enqueueNotification(token, signature, pid) {
-  await insertTokenRow(token, signature, pid, 0, null);
+async function enqueueNotification(token, signature, pid, metadata = null) {
+  await insertTokenRow(token, signature, pid, 0, metadata);
+  let queued = false;
   if (!notifyQueue.some(x => x.token === token)) {
-    notifyQueue.push({ token, signature, pid, ts: Date.now() });
+    notifyQueue.push({ token, signature, pid, ts: Date.now(), metadata });
+    queued = true;
   }
   processNotifyQueue();
+  return queued;
 }
 async function processNotifyQueue() {
   if (notifyProcessing) return;
@@ -691,55 +1108,50 @@ async function processEvent(evt) {
     dumpedTxs.add(signature);
     setTimeout(() => dumpedTxs.delete(signature), 60000);
     debugLog('Processing event', signature);
-    // Structured payloads
-    if (evt.tokenTransfers && evt.tokenTransfers.length) {
-      const mints = new Set();
-      for (const t of evt.tokenTransfers) if (t.mint) mints.add(t.mint);
-      const pid = findProgramInLogs(evt.logs) || null;
-      for (const mint of mints) {
-        await insertTokenRow(mint, signature, pid, 0, null);
-        await enqueueNotification(mint, signature, pid);
-      }
+    const { context, candidates } = detectCandidatesFromEvent(evt);
+    if (!candidates.length) {
+      debugLog('No liquidity candidates for', signature);
       return;
     }
-    if (evt.events && evt.events.amm) {
-      try {
-        const amm = evt.events.amm;
-        const tokenA = amm.tokenA?.mint || amm.tokenA?.token?.mint;
-        const tokenB = amm.tokenB?.mint || amm.tokenB?.token?.mint;
-        const pid = findProgramInLogs(evt.logs) || null;
-        if (tokenA) { await insertTokenRow(tokenA, signature, pid, 0, null); await enqueueNotification(tokenA, signature, pid); }
-        if (tokenB) { await insertTokenRow(tokenB, signature, pid, 0, null); await enqueueNotification(tokenB, signature, pid); }
-        return;
-      } catch (e) {
-        debugLog('AMM parse error', e?.message || e);
+    const blockTime = context.blockTime || evt.blockTime || (evt.value && evt.value.blockTime) || null;
+    const effectiveEpoch = blockTime || Math.floor(Date.now() / 1000);
+    if (ONLY_TODAY && blockTime && !isTodayInTZ(blockTime, USER_TZ)) {
+      debugLog('Skipping non-today event', signature);
+      return;
+    }
+    if (!isFreshByAge(effectiveEpoch)) {
+      debugLog('Skipping stale event', signature);
+      return;
+    }
+    const viable = candidates.filter(candidate => candidatePassesFilters(candidate, context));
+    if (!viable.length) {
+      debugLog('All candidates filtered out for', signature);
+      return;
+    }
+    for (const candidate of viable) {
+      const mint = candidate.mint;
+      if (!mint) continue;
+      const programId = candidate.programIds[0] || context.programFromLogs || null;
+      const detectionMetadata = {
+        detection: {
+          score: candidate.score,
+          sources: candidate.sources,
+          details: [...candidate.details, { source: 'event-context', blockTime: blockTime || null, slot: context.slot || null }],
+          timestamp: Date.now()
+        }
+      };
+      if (VERIFY_MINT_BEFORE_NOTIFY) {
+        const verification = await verifyCandidate(signature, mint);
+        if (!verification.ok) {
+          warn('Pre-verification failed for', mint);
+          continue;
+        }
       }
-    }
-    if (!evt.logs || !Array.isArray(evt.logs)) return;
-    // Owner whitelist check
-    if (EFFECTIVE_WHITELIST.length) {
-      const inWl = evt.logs.some(line => typeof line === 'string' && EFFECTIVE_WHITELIST.some(pid => pid && line.includes(pid)));
-      if (!inWl) return;
-    }
-    // Program IDs filter
-    if (PROGRAM_IDS.length) {
-      const hasProg = evt.logs.some(line => typeof line === 'string' && PROGRAM_IDS.some(pid => pid && line.includes(pid)));
-      if (!hasProg) return;
-    }
-    // Liquidity markers
-    const hasMark = evt.logs.some(l => liquidityMarkers.some(rx => rx.test(String(l))));
-    if (!hasMark) return;
-    debugLog('Liquidity markers found for', signature);
-    const candidates = extractCandidatesFromLogs(evt.logs);
-    if (!candidates.length) return;
-    for (const { candidate } of candidates) {
-      const v = await verifyCandidate(signature, candidate);
-      if (v.ok) {
-        const pid = findProgramInLogs(evt.logs);
-        await insertTokenRow(candidate, signature, pid, 1, v.metadata || null);
-        await enqueueNotification(candidate, signature, pid);
-        log('Verified & notified', candidate);
-        return;
+      const queued = await enqueueNotification(mint, signature, programId, detectionMetadata);
+      if (queued) {
+        log('Queued candidate', mint, 'score', candidate.score, 'sources', candidate.sources.join(','));
+      } else {
+        debugLog('Candidate already queued', mint);
       }
     }
   } catch (e) {
