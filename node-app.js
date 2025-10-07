@@ -423,6 +423,65 @@ async function solscanGetTokenMetadata(mint) {
   }
 }
 
+async function solscanVerifyMint(mint) {
+  if (!SOLSCAN_API_KEY || !mint) return { ok: false };
+  try {
+    const meta = await solscanGetTokenMetadata(mint);
+    if (meta && meta.data) {
+      return {
+        ok: true,
+        metadata: {
+          source: 'solscan',
+          info: {
+            name: meta.data.name,
+            symbol: meta.data.symbol,
+            supply: meta.data.tokenInfo?.supply || null
+          }
+        }
+      };
+    }
+  } catch (e) {
+    debugLog('solscanVerifyMint error', e?.message || e);
+  }
+  return { ok: false };
+}
+
+async function getTokenSupply(mint) {
+  if (!RPC_URL || !mint) return null;
+  try {
+    const body = {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'getTokenSupply',
+      params: [mint, { commitment: RPC_COMMITMENT }]
+    };
+    const data = await httpPostWithRetry(RPC_URL, body);
+    return data?.result || null;
+  } catch (e) {
+    debugLog('getTokenSupply error', e?.message || e);
+    return null;
+  }
+}
+
+async function verifyMintViaTokenSupply(mint) {
+  const res = await getTokenSupply(mint);
+  if (!res) return { ok: false };
+  const amount = Number(res.value?.amount || 0);
+  if (Number.isFinite(amount) && amount >= 0) {
+    return {
+      ok: true,
+      metadata: {
+        source: 'tokenSupply',
+        info: {
+          amount,
+          decimals: res.value?.decimals ?? null
+        }
+      }
+    };
+  }
+  return { ok: false };
+}
+
 /* =====================================
  * Verification & metadata
  * ===================================*/
@@ -472,14 +531,30 @@ async function verifyMintViaTransaction(sig, candidate) {
   const meta = tx.meta || {};
   const post = meta.postTokenBalances || [];
   for (const p of post) {
-    if (p && p.mint === candidate) return { ok: true, metadata: { source: 'postTokenBalances', info: p } };
+    if (p && p.mint === candidate) {
+      return {
+        ok: true,
+        metadata: {
+          source: 'postTokenBalances',
+          info: p,
+          blockTime
+        }
+      };
+    }
   }
   const instructions = tx.transaction?.message?.instructions || [];
   for (const ins of instructions) {
     const parsed = ins.parsed || {};
     const info = parsed.info || {};
     if (info.mint === candidate || info.tokenMint === candidate || info.account === candidate) {
-      return { ok: true, metadata: { source: 'instruction', info: parsed } };
+      return {
+        ok: true,
+        metadata: {
+          source: 'instruction',
+          info: parsed,
+          blockTime
+        }
+      };
     }
   }
   return { ok: false };
@@ -492,36 +567,58 @@ async function verifyMintViaAccount(addr) {
   return { ok: false };
 }
 async function verifyCandidate(sig, candidate) {
-  if (!candidate) return { ok: false };
+  if (!candidate || !isBase58OrSystem(candidate)) return { ok: false };
   if (verifiedCache.has(candidate)) return { ok: true, source: 'cache' };
   if (await isTokenVerifiedInDB(candidate)) {
     verifiedCache.set(candidate, { verifiedAt: Date.now() });
     return { ok: true, source: 'db' };
   }
   return scheduleVerify(async () => {
-    // Try transaction verification first
-    if (sig) {
-      for (let i = 0; i < VERIFY_RETRIES; i++) {
-        const r = await verifyMintViaTransaction(sig, candidate);
-        if (r.ok) {
-          verifiedCache.set(candidate, { verifiedAt: Date.now() });
-          await markTokenVerified(candidate, r.metadata);
-          return { ok: true, method: 'transaction', metadata: r.metadata };
+    const strategies = [
+      {
+        name: 'transaction',
+        enabled: !!sig,
+        retries: VERIFY_RETRIES,
+        fn: () => verifyMintViaTransaction(sig, candidate)
+      },
+      {
+        name: 'account',
+        enabled: true,
+        retries: Math.max(1, Math.floor(VERIFY_RETRIES / 2)),
+        fn: () => verifyMintViaAccount(candidate)
+      },
+      {
+        name: 'tokenSupply',
+        enabled: true,
+        retries: 1,
+        fn: () => verifyMintViaTokenSupply(candidate)
+      }
+    ];
+    if (SOLSCAN_API_KEY) {
+      strategies.push({
+        name: 'solscan',
+        enabled: true,
+        retries: 1,
+        fn: () => solscanVerifyMint(candidate)
+      });
+    }
+    for (const strat of strategies) {
+      if (!strat.enabled) continue;
+      const retries = Math.max(1, strat.retries || 1);
+      for (let attempt = 0; attempt < retries; attempt++) {
+        const res = await strat.fn();
+        if (res && res.ok) {
+          const metadata = {
+            ...(res.metadata || {}),
+            strategy: strat.name
+          };
+          verifiedCache.set(candidate, { verifiedAt: Date.now(), strategy: strat.name });
+          await markTokenVerified(candidate, metadata);
+          return { ok: true, method: strat.name, metadata };
         }
-        const base = VERIFY_BASE_DELAY_MS * Math.pow(2, i);
+        const base = VERIFY_BASE_DELAY_MS * Math.pow(2, attempt);
         await sleep(currentThrottleDelay(base));
       }
-    }
-    // Fallback to account inspection
-    for (let i = 0; i < VERIFY_RETRIES; i++) {
-      const r2 = await verifyMintViaAccount(candidate);
-      if (r2.ok) {
-        verifiedCache.set(candidate, { verifiedAt: Date.now() });
-        await markTokenVerified(candidate, r2.metadata);
-        return { ok: true, method: 'account', metadata: r2.metadata };
-      }
-      const base = VERIFY_BASE_DELAY_MS * Math.pow(2, i);
-      await sleep(currentThrottleDelay(base));
     }
     return { ok: false };
   });
@@ -562,6 +659,229 @@ function findProgramInLogs(logs) {
   return null;
 }
 
+function extractMintsFromTokenTransfers(evt, context) {
+  const transfers = Array.isArray(evt?.tokenTransfers) ? evt.tokenTransfers : [];
+  const derived = [];
+  for (const transfer of transfers) {
+    if (!transfer || !transfer.mint) continue;
+    derived.push({
+      mint: transfer.mint,
+      programId: transfer.programId || context.primaryProgram || null,
+      source: 'tokenTransfers',
+      weight: 6,
+      metadata: {
+        from: transfer.fromUserAccount || transfer.fromTokenAccount || null,
+        to: transfer.toUserAccount || transfer.toTokenAccount || null,
+        amount: transfer.tokenAmount || transfer.amount || transfer.uiTokenAmount || null
+      },
+      autoVerified: true
+    });
+  }
+  return derived;
+}
+
+function extractMintsFromAmmEvent(evt, context) {
+  const amm = evt?.events?.amm;
+  if (!amm) return [];
+  const results = [];
+  const tokens = [
+    { mint: amm.tokenA?.mint || amm.tokenA?.token?.mint, label: 'tokenA' },
+    { mint: amm.tokenB?.mint || amm.tokenB?.token?.mint, label: 'tokenB' }
+  ];
+  for (const tok of tokens) {
+    if (!tok.mint) continue;
+    results.push({
+      mint: tok.mint,
+      programId: context.primaryProgram || null,
+      source: 'ammEvent',
+      weight: 5,
+      metadata: { side: tok.label },
+      autoVerified: true
+    });
+  }
+  return results;
+}
+
+function extractMintsFromBalanceChanges(evt, context) {
+  const meta = evt?.meta || evt?.transactionMeta || {};
+  const post = meta?.postTokenBalances || evt?.postTokenBalances || [];
+  const pre = meta?.preTokenBalances || evt?.preTokenBalances || [];
+  if (!Array.isArray(post) || post.length === 0) return [];
+  const preMap = new Map();
+  for (const entry of pre) {
+    if (!entry?.mint) continue;
+    const key = `${entry.mint}:${entry.owner || entry.accountIndex || 'unknown'}`;
+    const amount = Number(entry.uiTokenAmount?.amount || 0);
+    preMap.set(key, Number.isFinite(amount) ? amount : 0);
+  }
+  const results = [];
+  for (const entry of post) {
+    if (!entry?.mint) continue;
+    const key = `${entry.mint}:${entry.owner || entry.accountIndex || 'unknown'}`;
+    const amount = Number(entry.uiTokenAmount?.amount || 0);
+    if (!Number.isFinite(amount)) continue;
+    const prev = preMap.get(key) || 0;
+    if (amount > prev) {
+      results.push({
+        mint: entry.mint,
+        programId: context.primaryProgram || null,
+        source: 'balanceChange',
+        weight: 4 + Math.min(2, Math.log10(amount - prev + 1)),
+        metadata: {
+          delta: amount - prev,
+          owner: entry.owner || null,
+          accountIndex: entry.accountIndex ?? null
+        },
+        autoVerified: true
+      });
+    }
+  }
+  return results;
+}
+
+function extractMintsFromInstructions(evt, context) {
+  const list = [];
+  const outer = evt?.transaction?.message?.instructions || [];
+  const inner = Array.isArray(evt?.meta?.innerInstructions)
+    ? evt.meta.innerInstructions.flatMap(x => x?.instructions || [])
+    : [];
+  const provided = Array.isArray(evt?.instructions) ? evt.instructions : [];
+  const combined = [...outer, ...inner, ...provided];
+  for (const instruction of combined) {
+    if (!instruction) continue;
+    const parsed = instruction.parsed || {};
+    const info = parsed.info || {};
+    const programId = instruction.programId || instruction.programIdIndex || context.primaryProgram || null;
+    const typeName = typeof parsed?.type === 'string' ? parsed.type : '';
+    const isMintRelated = /mint|liquidity|create|initialize|pool/i.test(typeName || '');
+    const possibleMints = [
+      info.mint,
+      info.tokenMint,
+      isMintRelated && typeof info.account === 'string' ? info.account : null,
+      info.sourceMint,
+      info.destinationMint,
+      info.poolMint,
+      instruction.mint
+    ].filter(Boolean);
+    for (const mint of possibleMints) {
+      list.push({
+        mint,
+        programId: typeof programId === 'string' ? programId : context.primaryProgram || null,
+        source: 'instruction',
+        weight: isMintRelated ? 4 : 2,
+        metadata: {
+          parsed: parsed?.type || null,
+          infoKeys: Object.keys(info || {})
+        }
+      });
+    }
+    if (isMintRelated && Array.isArray(instruction.accounts)) {
+      for (const acct of instruction.accounts) {
+        if (typeof acct === 'string' && isBase58OrSystem(acct)) {
+          list.push({
+            mint: acct,
+            programId: typeof programId === 'string' ? programId : context.primaryProgram || null,
+            source: 'instructionAccount',
+            weight: 2,
+            metadata: { accountIndex: instruction.accounts.indexOf(acct) }
+          });
+        }
+      }
+    }
+  }
+  return list;
+}
+
+function extractMintsFromLogsWithPrograms(evt, context) {
+  const logs = Array.isArray(context.logs) ? context.logs : [];
+  if (!logs.length) return [];
+  if (EFFECTIVE_WHITELIST.length) {
+    const inWhitelist = logs.some(line => typeof line === 'string' && EFFECTIVE_WHITELIST.some(pid => pid && line.includes(pid)));
+    if (!inWhitelist) return [];
+  }
+  if (PROGRAM_IDS.length) {
+    const hasProgram = logs.some(line => typeof line === 'string' && PROGRAM_IDS.some(pid => pid && line.includes(pid)));
+    if (!hasProgram) return [];
+  }
+  const hasMarker = logs.some(line => liquidityMarkers.some(rx => rx.test(String(line))));
+  if (!hasMarker) return [];
+  const candidates = extractCandidatesFromLogs(logs);
+  return candidates.map(c => ({
+    mint: c.candidate,
+    programId: context.primaryProgram || null,
+    source: 'logs',
+    weight: 1 + c.score,
+    metadata: {
+      score: c.score,
+      sampleLog: logs.slice(0, 3)
+    }
+  }));
+}
+
+const eventCandidateExtractors = [
+  extractMintsFromTokenTransfers,
+  extractMintsFromAmmEvent,
+  extractMintsFromBalanceChanges,
+  extractMintsFromInstructions,
+  extractMintsFromLogsWithPrograms
+];
+
+function gatherMintCandidates(evt, signature) {
+  const logs = Array.isArray(evt?.logs) ? evt.logs : (evt?.meta?.logMessages || []);
+  const primaryProgram = findProgramInLogs(logs) || evt?.programId || null;
+  const context = { signature, logs, primaryProgram };
+  const aggregate = new Map();
+  for (const extractor of eventCandidateExtractors) {
+    let results = [];
+    try {
+      results = extractor(evt, context) || [];
+    } catch (e) {
+      debugLog('Extractor error', extractor.name || 'anonymous', e?.message || e);
+      continue;
+    }
+    for (const item of results) {
+      if (!item || !item.mint) continue;
+      if (!isBase58OrSystem(item.mint) || item.mint === '11111111111111111111111111111111') continue;
+      const key = item.mint;
+      const existing = aggregate.get(key) || {
+        mint: key,
+        programIds: new Set(),
+        weight: 0,
+        sources: [],
+        autoVerified: false
+      };
+      if (item.programId && typeof item.programId === 'string') existing.programIds.add(item.programId);
+      existing.weight += item.weight || 1;
+      if (existing.sources.length < 8) {
+        existing.sources.push({
+          source: item.source,
+          metadata: item.metadata || null
+        });
+      }
+      existing.autoVerified = existing.autoVerified || !!item.autoVerified;
+      aggregate.set(key, existing);
+    }
+  }
+  const candidates = [];
+  for (const entry of aggregate.values()) {
+    const programIds = Array.from(entry.programIds);
+    const metadata = {
+      signature,
+      weight: entry.weight,
+      sources: entry.sources,
+      programIds
+    };
+    candidates.push({
+      mint: entry.mint,
+      programId: programIds[0] || primaryProgram || null,
+      metadata,
+      autoVerified: entry.autoVerified,
+      weight: entry.weight
+    });
+  }
+  return { candidates, context };
+}
+
 /* =====================================
  * Fallback inspector: programNotification pubkey -> signatures -> tx -> mint
  * ===================================*/
@@ -588,6 +908,7 @@ async function inspectSignaturesForMint(pubkey, limit = FALLBACK_SIGNATURE_LIMIT
     try {
       const sigRows = await getRecentSignaturesForAddress(pubkey, limit);
       if (!sigRows.length) return false;
+      let foundAny = false;
       for (const row of sigRows) {
         const signature = row?.signature || (typeof row === 'string' ? row : null);
         if (!signature) continue;
@@ -596,30 +917,35 @@ async function inspectSignaturesForMint(pubkey, limit = FALLBACK_SIGNATURE_LIMIT
         const blockTime = tx.blockTime || null;
         if (ONLY_TODAY && blockTime && !isTodayInTZ(blockTime, USER_TZ)) continue;
         if (!isFreshByAge(blockTime || Math.floor(Date.now() / 1000))) continue;
-        // Optionally use Solscan for chain info (we can call and log but not required)
-        // 1) Check postTokenBalances
-        const post = tx.meta?.postTokenBalances || [];
-        for (const p of post) {
-          if (p && p.mint) {
-            const mint = p.mint;
-            const pid = findProgramInLogs(tx.meta?.logMessages || []) || null;
-            await insertTokenRow(mint, signature, pid, 0, { source: 'fallback-post', info: p });
-            await enqueueNotification(mint, signature, pid);
-            return true;
+        const syntheticEvent = {
+          signature,
+          logs: tx.meta?.logMessages || [],
+          meta: tx.meta || {},
+          transaction: tx.transaction || null,
+          tokenTransfers: Array.isArray(tx.tokenTransfers)
+            ? tx.tokenTransfers
+            : (tx.meta?.postTokenBalances || []).map(p => ({
+              mint: p?.mint,
+              toUserAccount: p?.owner || null,
+              tokenAmount: p?.uiTokenAmount?.amount || null,
+              programId: findProgramInLogs(tx.meta?.logMessages || []) || null
+            }))
+        };
+        const { candidates } = gatherMintCandidates(syntheticEvent, signature);
+        if (!candidates.length) continue;
+        for (const cand of candidates) {
+          const pid = cand.programId || findProgramInLogs(syntheticEvent.logs) || null;
+          const enrichedMeta = { ...(cand.metadata || {}), source: 'fallback' };
+          await insertTokenRow(cand.mint, signature, pid, cand.autoVerified ? 1 : 0, enrichedMeta);
+          if (cand.autoVerified) {
+            verifiedCache.set(cand.mint, { verifiedAt: Date.now(), strategy: 'fallback' });
+            await markTokenVerified(cand.mint, enrichedMeta);
           }
-        }
-        // 2) Logs
-        const logs = tx.meta?.logMessages || [];
-        const candidates = extractCandidatesFromLogs(logs);
-        if (candidates && candidates.length) {
-          const top = candidates[0].candidate;
-          const pid = findProgramInLogs(logs) || null;
-          await insertTokenRow(top, signature, pid, 0, { source: 'fallback-log', score: candidates[0].score });
-          await enqueueNotification(top, signature, pid);
-          return true;
+          await enqueueNotification(cand.mint, signature, pid);
+          foundAny = true;
         }
       }
-      return false;
+      return foundAny;
     } finally {
       releaseInspectSlot();
       inspectingPubkeys.set(pubkey, Date.now());
@@ -679,7 +1005,6 @@ async function processNotifyQueue() {
 async function processEvent(evt) {
   try {
     if (!evt) return;
-    // Program notifications may come without signature
     if (evt.value && evt.value.pubkey && !evt.signature && !evt.txSignature) {
       debugLog('Received programNotification pubkey', evt.value.pubkey);
       await inspectSignaturesForMint(evt.value.pubkey).catch(() => {});
@@ -691,56 +1016,22 @@ async function processEvent(evt) {
     dumpedTxs.add(signature);
     setTimeout(() => dumpedTxs.delete(signature), 60000);
     debugLog('Processing event', signature);
-    // Structured payloads
-    if (evt.tokenTransfers && evt.tokenTransfers.length) {
-      const mints = new Set();
-      for (const t of evt.tokenTransfers) if (t.mint) mints.add(t.mint);
-      const pid = findProgramInLogs(evt.logs) || null;
-      for (const mint of mints) {
-        await insertTokenRow(mint, signature, pid, 0, null);
-        await enqueueNotification(mint, signature, pid);
-      }
-      return;
-    }
-    if (evt.events && evt.events.amm) {
-      try {
-        const amm = evt.events.amm;
-        const tokenA = amm.tokenA?.mint || amm.tokenA?.token?.mint;
-        const tokenB = amm.tokenB?.mint || amm.tokenB?.token?.mint;
-        const pid = findProgramInLogs(evt.logs) || null;
-        if (tokenA) { await insertTokenRow(tokenA, signature, pid, 0, null); await enqueueNotification(tokenA, signature, pid); }
-        if (tokenB) { await insertTokenRow(tokenB, signature, pid, 0, null); await enqueueNotification(tokenB, signature, pid); }
-        return;
-      } catch (e) {
-        debugLog('AMM parse error', e?.message || e);
-      }
-    }
-    if (!evt.logs || !Array.isArray(evt.logs)) return;
-    // Owner whitelist check
-    if (EFFECTIVE_WHITELIST.length) {
-      const inWl = evt.logs.some(line => typeof line === 'string' && EFFECTIVE_WHITELIST.some(pid => pid && line.includes(pid)));
-      if (!inWl) return;
-    }
-    // Program IDs filter
-    if (PROGRAM_IDS.length) {
-      const hasProg = evt.logs.some(line => typeof line === 'string' && PROGRAM_IDS.some(pid => pid && line.includes(pid)));
-      if (!hasProg) return;
-    }
-    // Liquidity markers
-    const hasMark = evt.logs.some(l => liquidityMarkers.some(rx => rx.test(String(l))));
-    if (!hasMark) return;
-    debugLog('Liquidity markers found for', signature);
-    const candidates = extractCandidatesFromLogs(evt.logs);
+    const { candidates, context } = gatherMintCandidates(evt, signature);
     if (!candidates.length) return;
-    for (const { candidate } of candidates) {
-      const v = await verifyCandidate(signature, candidate);
-      if (v.ok) {
-        const pid = findProgramInLogs(evt.logs);
-        await insertTokenRow(candidate, signature, pid, 1, v.metadata || null);
-        await enqueueNotification(candidate, signature, pid);
-        log('Verified & notified', candidate);
-        return;
+    for (const cand of candidates) {
+      const pid = cand.programId || context.primaryProgram || findProgramInLogs(context.logs) || null;
+      const metadata = {
+        ...(cand.metadata || {}),
+        detectionWeight: cand.weight,
+        detectedAt: Date.now(),
+        origin: (cand.metadata && cand.metadata.origin) || 'event'
+      };
+      await insertTokenRow(cand.mint, signature, pid, cand.autoVerified ? 1 : 0, metadata);
+      if (cand.autoVerified) {
+        verifiedCache.set(cand.mint, { verifiedAt: Date.now(), strategy: 'event' });
+        await markTokenVerified(cand.mint, metadata);
       }
+      await enqueueNotification(cand.mint, signature, pid);
     }
   } catch (e) {
     errLog('processEvent error', e?.message || e);
